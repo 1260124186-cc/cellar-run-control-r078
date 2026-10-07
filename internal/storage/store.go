@@ -81,27 +81,56 @@ func normalizeSnapshot(value domain.Snapshot) (domain.Snapshot, error) {
 	if err := validateIndexes(value); err != nil {
 		return domain.Snapshot{}, err
 	}
-	normalizeRunStepProgress(&value)
+	if err := normalizeRunStepProgress(&value); err != nil {
+		return domain.Snapshot{}, err
+	}
 	return value, nil
 }
 
-func normalizeRunStepProgress(value *domain.Snapshot) {
+// normalizeRunStepProgress rebuilds each run's current-step pointer from its
+// persisted step facts so that a controller restart exposes exactly the same
+// state. It never rewrites a recorded start or completion time: those are the
+// single source of truth. Completions are expected to form a strict prefix,
+// followed by at most one in-progress step.
+func normalizeRunStepProgress(value *domain.Snapshot) error {
 	for id, run := range value.Runs {
 		if len(run.StepProgress) == 0 {
+			run.CurrentStep = 0
+			value.Runs[id] = run
 			continue
 		}
-		if run.CurrentStep < 1 || run.CurrentStep > len(run.StepProgress)+1 {
-			run.CurrentStep = 1
-		}
-		if run.CurrentStep <= len(run.StepProgress) {
-			step := &run.StepProgress[run.CurrentStep-1]
-			if step.CompletedAt == nil && step.StartedAt != nil && !run.UpdatedAt.IsZero() {
-				stamp := run.UpdatedAt.UTC()
-				step.StartedAt = &stamp
+		completed := 0
+		for _, step := range run.StepProgress {
+			if step.CompletedAt == nil {
+				break
 			}
+			completed++
+		}
+		// Completions must form a prefix: a later step cannot be completed
+		// while an earlier one is still open.
+		for _, step := range run.StepProgress[completed:] {
+			if step.CompletedAt != nil {
+				return fmt.Errorf("run %s has out-of-order completed formula steps", id)
+			}
+		}
+		if completed < len(run.StepProgress) {
+			current := &run.StepProgress[completed]
+			if current.StartedAt == nil {
+				return fmt.Errorf("run %s current formula step is missing its start time", id)
+			}
+			// Only the single in-progress step may carry a start time.
+			for _, trailing := range run.StepProgress[completed+1:] {
+				if trailing.StartedAt != nil {
+					return fmt.Errorf("run %s started a formula step ahead of the current step", id)
+				}
+			}
+			run.CurrentStep = completed + 1
+		} else {
+			run.CurrentStep = len(run.StepProgress) + 1
 		}
 		value.Runs[id] = run
 	}
+	return nil
 }
 
 func validateIndexes(value domain.Snapshot) error {
@@ -167,6 +196,11 @@ func (s *Store) View(visitor func(domain.Snapshot) error) error {
 	return visitor(copied)
 }
 
+// ErrNoMutation is returned from an Update mutator when the request does not
+// change any aggregate state (for example an idempotent replay). The store
+// skips the revision bump, snapshot write, and in-memory replacement.
+var ErrNoMutation = errors.New("no mutation required")
+
 func (s *Store) Update(expected *int64, mutate func(*domain.Snapshot) error) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -177,6 +211,9 @@ func (s *Store) Update(expected *int64, mutate func(*domain.Snapshot) error) err
 	}
 	candidate := s.snapshot.Clone()
 	if err := mutate(&candidate); err != nil {
+		if errors.Is(err, ErrNoMutation) {
+			return nil
+		}
 		return err
 	}
 	candidate.Revision = s.snapshot.Revision + 1

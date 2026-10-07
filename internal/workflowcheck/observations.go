@@ -185,6 +185,46 @@ func createStartedRun(
 	code string,
 	advance func(time.Duration),
 ) (pairView, error) {
+	started, err := createStartedRunAt(api, formulaID, vesselID, code, advance, false)
+	if err != nil {
+		return pairView{}, err
+	}
+	version := started.Run.Version
+	for sequence := 1; sequence <= 3; sequence++ {
+		advance(5 * time.Hour)
+		stepResponse, err := api.call(
+			"POST",
+			"/v1/runs/"+started.Run.ID+"/steps/advance",
+			map[string]any{"sequence": sequence},
+			ptrInt64(version),
+		)
+		if err != nil {
+			return pairView{}, err
+		}
+		if err := requireStatus(stepResponse, 200, "advance formula step"); err != nil {
+			return pairView{}, err
+		}
+		var updated runView
+		if err := stepResponse.decode(&updated); err != nil {
+			return pairView{}, err
+		}
+		version = updated.Version
+	}
+	started.Run.Version = version
+	return started, nil
+}
+
+// createStartedRunAt creates, reserves, and starts a run without confirming any
+// formula step. When advanceSteps is true it follows the historical behavior of
+// stepping through the formula; callers that validate step timing pass false.
+func createStartedRunAt(
+	api *client,
+	formulaID string,
+	vesselID string,
+	code string,
+	advance func(time.Duration),
+	advanceSteps bool,
+) (pairView, error) {
 	runResponse, err := api.call("POST", "/v1/runs",
 		createRunPayload(code, formulaID), nil)
 	if err != nil {
@@ -220,6 +260,9 @@ func createStartedRun(
 	var started pairView
 	if err := startResponse.decode(&started); err != nil {
 		return pairView{}, err
+	}
+	if !advanceSteps {
+		return started, nil
 	}
 	version := started.Run.Version
 	for sequence := 1; sequence <= 3; sequence++ {

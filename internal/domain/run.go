@@ -129,16 +129,19 @@ func (r *FermentationRun) StartFermentation(now time.Time, recipe []FormulaStep)
 	return nil
 }
 
+// StepsComplete reports whether every formula step has a recorded
+// completion time. A single completed step is not enough: completions form a
+// strict prefix and the run is not ready until the final step is recorded.
 func (r FermentationRun) StepsComplete() bool {
 	if len(r.StepProgress) == 0 {
 		return true
 	}
 	for _, step := range r.StepProgress {
-		if step.CompletedAt != nil {
-			return true
+		if step.CompletedAt == nil {
+			return false
 		}
 	}
-	return false
+	return true
 }
 
 func (r FermentationRun) RequireStepsComplete() error {
@@ -149,6 +152,19 @@ func (r FermentationRun) RequireStepsComplete() error {
 	return nil
 }
 
+// IsRecipeStepConfirmed reports whether the requested step already has a
+// recorded completion. Such a confirmation is an idempotent replay: it must
+// return the recorded fact without advancing the version or rewriting times.
+func (r FermentationRun) IsRecipeStepConfirmed(sequence int) bool {
+	if sequence < 1 || sequence > len(r.StepProgress) {
+		return false
+	}
+	return r.StepProgress[sequence-1].CompletedAt != nil
+}
+
+// AdvanceRecipeStep records completion of the single current formula step.
+// It returns changed=false (and mutates nothing) when the request replays a
+// step that is already recorded.
 func (r *FermentationRun) AdvanceRecipeStep(sequence int, now time.Time) (bool, error) {
 	if r.State != RunFermenting {
 		return false, NewError(CodeRunState,
@@ -158,12 +174,9 @@ func (r *FermentationRun) AdvanceRecipeStep(sequence int, now time.Time) (bool, 
 		return false, NewError(CodeRunState, "formula step was not found")
 	}
 	step := &r.StepProgress[sequence-1]
-	stamp := now.UTC()
 	if step.CompletedAt != nil {
-		step.CompletedAt = &stamp
-		r.UpdatedAt = stamp
-		r.Version++
-		return true, nil
+		// Repeated confirmation of the same fact is a no-op.
+		return false, nil
 	}
 	if sequence != r.CurrentStep {
 		return false, NewError(CodeRunState,
@@ -174,10 +187,11 @@ func (r *FermentationRun) AdvanceRecipeStep(sequence int, now time.Time) (bool, 
 			"current formula step has no start time")
 	}
 	hold := time.Duration(step.HoldMinutes) * time.Minute
-	if now.UTC().Before(r.UpdatedAt.UTC().Add(hold)) {
+	if now.UTC().Before(step.StartedAt.UTC().Add(hold)) {
 		return false, NewError(CodeRunState,
 			"formula step hold time has not elapsed")
 	}
+	stamp := now.UTC()
 	step.CompletedAt = &stamp
 	if sequence < len(r.StepProgress) {
 		r.CurrentStep = sequence + 1

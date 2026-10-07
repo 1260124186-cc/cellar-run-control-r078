@@ -115,6 +115,7 @@ Run each production workflow check separately:
 go run ./cmd/fermentctl check formula-approval
 go run ./cmd/fermentctl check vessel-run-lifecycle
 go run ./cmd/fermentctl check observations-completion
+go run ./cmd/fermentctl check step-execution
 ```
 
 Each check creates a temporary snapshot directory, starts the real HTTP

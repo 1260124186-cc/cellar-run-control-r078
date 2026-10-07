@@ -4,6 +4,7 @@ import (
 	"sort"
 
 	"github.com/1260124186-cc/solo-0016-cellar-run-control/internal/domain"
+	"github.com/1260124186-cc/solo-0016-cellar-run-control/internal/storage"
 )
 
 type AdvanceStepInput struct {
@@ -157,6 +158,19 @@ func (s *Service) AdvanceRunStep(
 		if !ok {
 			return domain.NewError(domain.CodeRunNotFound, "run was not found")
 		}
+		// Step confirmation only applies to a fermenting run. Completed or
+		// aborted runs are immutable and cannot replay steps either.
+		if run.State != domain.RunFermenting {
+			return domain.NewError(domain.CodeRunState,
+				"only a fermenting run can advance formula steps")
+		}
+		// A repeated confirmation of an already recorded step is the same
+		// fact: return it as-is instead of raising a version conflict or
+		// rewriting the completion time.
+		if run.IsRecipeStepConfirmed(input.Sequence) {
+			updated = run.Clone()
+			return storage.ErrNoMutation
+		}
 		if err := s.checkExpected(run.Version, input.ExpectedVersion); err != nil {
 			return err
 		}
@@ -164,9 +178,11 @@ func (s *Service) AdvanceRunStep(
 		if err != nil {
 			return err
 		}
-		if changed {
-			snapshot.Runs[id] = run.Clone()
+		if !changed {
+			updated = run.Clone()
+			return storage.ErrNoMutation
 		}
+		snapshot.Runs[id] = run.Clone()
 		updated = run.Clone()
 		return nil
 	})

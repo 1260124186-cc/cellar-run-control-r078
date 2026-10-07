@@ -42,6 +42,10 @@ func Run(name string) error {
 		if err := observationsCompletion(api, fixedClock.Advance); err != nil {
 			return err
 		}
+	case "step-execution":
+		if err := stepExecution(api, fixedClock, dataDir); err != nil {
+			return err
+		}
 	default:
 		return fmt.Errorf("unknown workflow check %q", name)
 	}
