@@ -133,12 +133,13 @@ func (r FermentationRun) StepsComplete() bool {
 	if len(r.StepProgress) == 0 {
 		return true
 	}
+	// Every step must be finished; a single open step keeps the run open.
 	for _, step := range r.StepProgress {
-		if step.CompletedAt != nil {
-			return true
+		if step.CompletedAt == nil {
+			return false
 		}
 	}
-	return false
+	return true
 }
 
 func (r FermentationRun) RequireStepsComplete() error {
@@ -149,35 +150,70 @@ func (r FermentationRun) RequireStepsComplete() error {
 	return nil
 }
 
-func (r *FermentationRun) AdvanceRecipeStep(sequence int, now time.Time) (bool, error) {
+// StepAdvanceOutcome classifies a step-confirmation request without mutating
+// the run.
+type StepAdvanceOutcome int
+
+const (
+	// StepAdvanceReplay means the step is already recorded; the caller must
+	// return the existing facts idempotently.
+	StepAdvanceReplay StepAdvanceOutcome = iota
+	// StepAdvanceReady means the current step has held long enough and this
+	// call may record its completion.
+	StepAdvanceReady
+)
+
+// InspectStepAdvance validates a step-confirmation request against the run
+// without changing anything. Completed runs, unknown steps, out-of-order
+// steps, and unelapsed holds return errors; an already completed step returns
+// StepAdvanceReplay.
+func (r *FermentationRun) InspectStepAdvance(sequence int, now time.Time) (StepAdvanceOutcome, error) {
 	if r.State != RunFermenting {
-		return false, NewError(CodeRunState,
+		return 0, NewError(CodeRunState,
 			"only a fermenting run can advance formula steps")
 	}
-	if sequence < 1 || sequence > len(r.StepProgress) {
-		return false, NewError(CodeRunState, "formula step was not found")
+	if len(r.StepProgress) == 0 {
+		return 0, NewError(CodeRunState, "formula step was not found")
 	}
-	step := &r.StepProgress[sequence-1]
-	stamp := now.UTC()
-	if step.CompletedAt != nil {
-		step.CompletedAt = &stamp
-		r.UpdatedAt = stamp
-		r.Version++
-		return true, nil
+	if sequence < 1 || sequence > len(r.StepProgress) {
+		return 0, NewError(CodeRunState, "formula step was not found")
+	}
+	// Replayed confirmation of an already completed step is the same request
+	// arriving again.
+	if r.StepProgress[sequence-1].CompletedAt != nil {
+		return StepAdvanceReplay, nil
 	}
 	if sequence != r.CurrentStep {
-		return false, NewError(CodeRunState,
+		if sequence < r.CurrentStep {
+			return 0, NewError(CodeRunState,
+				"formula step was already confirmed")
+		}
+		return 0, NewError(CodeRunState,
 			"only the current formula step can be completed")
 	}
+	step := &r.StepProgress[sequence-1]
 	if step.StartedAt == nil {
-		return false, NewError(CodeRunState,
+		return 0, NewError(CodeRunState,
 			"current formula step has no start time")
 	}
 	hold := time.Duration(step.HoldMinutes) * time.Minute
-	if now.UTC().Before(r.UpdatedAt.UTC().Add(hold)) {
-		return false, NewError(CodeRunState,
+	// Elapsed time is measured from when this step actually began. Run updates
+	// such as backfilled observations move UpdatedAt and must not shorten the
+	// required hold.
+	if now.UTC().Before(step.StartedAt.UTC().Add(hold)) {
+		return 0, NewError(CodeRunState,
 			"formula step hold time has not elapsed")
 	}
+	return StepAdvanceReady, nil
+}
+
+// AdvanceRecipeStep confirms completion of a recipe step. InspectStepAdvance
+// must have returned StepAdvanceReady for the same sequence and time. It
+// records the completion and opens exactly one following step (or marks every
+// step complete), then advances the run version once.
+func (r *FermentationRun) AdvanceRecipeStep(sequence int, now time.Time) error {
+	stamp := now.UTC()
+	step := &r.StepProgress[sequence-1]
 	step.CompletedAt = &stamp
 	if sequence < len(r.StepProgress) {
 		r.CurrentStep = sequence + 1
@@ -189,7 +225,7 @@ func (r *FermentationRun) AdvanceRecipeStep(sequence int, now time.Time) (bool, 
 	}
 	r.UpdatedAt = stamp
 	r.Version++
-	return true, nil
+	return nil
 }
 
 func (r *FermentationRun) AddObservation(observation GravityObservation) error {
@@ -273,4 +309,69 @@ func (r *FermentationRun) Abort(now time.Time) error {
 
 func (r FermentationRun) HadStarted() bool {
 	return r.StartedAt != nil
+}
+
+// NormalizeStepProgress reconciles the persisted current-step pointer with the
+// recorded per-step start and completion times. It never rewrites a recorded
+// time:
+//
+//   - runs without step progress leave the pointer at zero;
+//   - a zero pointer on an already started run is legacy state and is derived
+//     deterministically from the recorded steps (first open step, or n+1);
+//   - any non-zero pointer must match the recorded prefix of completed steps,
+//     and the step it points to must carry its original start time. Otherwise
+//     the snapshot is contradictory and startup must fail rather than silently
+//     inventing a different current step.
+func (r *FermentationRun) NormalizeStepProgress() error {
+	if len(r.StepProgress) == 0 {
+		r.CurrentStep = 0
+		return nil
+	}
+	completed := 0
+	for index := range r.StepProgress {
+		step := &r.StepProgress[index]
+		if step.CompletedAt == nil {
+			break
+		}
+		completed++
+		// Completed steps must have their recorded start time.
+		if step.StartedAt == nil {
+			return NewError(CodeStorage,
+				"completed formula step is missing its start time")
+		}
+	}
+	// Steps after the completed prefix must still be open, and open steps that
+	// have not yet been reached must carry no start time.
+	for index := completed; index < len(r.StepProgress); index++ {
+		step := &r.StepProgress[index]
+		if step.CompletedAt != nil {
+			return NewError(CodeStorage,
+				"formula step ordering is inconsistent in persisted state")
+		}
+		if index > completed && step.StartedAt != nil {
+			return NewError(CodeStorage,
+				"a future formula step already has a start time in persisted state")
+		}
+	}
+	derived := completed + 1
+	if r.CurrentStep == 0 {
+		r.CurrentStep = derived
+		return nil
+	}
+	if r.CurrentStep < 1 || r.CurrentStep > len(r.StepProgress)+1 {
+		return NewError(CodeStorage,
+			"current formula step pointer is outside the formula steps")
+	}
+	if r.CurrentStep != derived {
+		return NewError(CodeStorage,
+			"current formula step does not match recorded step progress")
+	}
+	if r.CurrentStep <= len(r.StepProgress) {
+		step := &r.StepProgress[r.CurrentStep-1]
+		if step.StartedAt == nil {
+			return NewError(CodeStorage,
+				"current formula step is missing its start time")
+		}
+	}
+	return nil
 }

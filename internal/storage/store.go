@@ -14,6 +14,11 @@ import (
 
 const stateFileName = "state.json"
 
+// ErrNoChange is returned by an Update mutator when the request was already
+// applied and must be answered from the recorded facts. The store treats it as
+// success: no snapshot revision is consumed and nothing is written.
+var ErrNoChange = errors.New("no state change required")
+
 type Store struct {
 	mu       sync.RWMutex
 	path     string
@@ -81,27 +86,29 @@ func normalizeSnapshot(value domain.Snapshot) (domain.Snapshot, error) {
 	if err := validateIndexes(value); err != nil {
 		return domain.Snapshot{}, err
 	}
-	normalizeRunStepProgress(&value)
+	if err := normalizeRunStepProgress(&value); err != nil {
+		return domain.Snapshot{}, err
+	}
 	return value, nil
 }
 
-func normalizeRunStepProgress(value *domain.Snapshot) {
+// normalizeRunStepProgress only derives a missing current-step pointer from the
+// recorded per-step facts. Recorded start and completion times are never
+// rewritten on restart.
+func normalizeRunStepProgress(value *domain.Snapshot) error {
 	for id, run := range value.Runs {
 		if len(run.StepProgress) == 0 {
+			if run.CurrentStep != 0 {
+				return fmt.Errorf("run %s has a current step but no step progress", id)
+			}
 			continue
 		}
-		if run.CurrentStep < 1 || run.CurrentStep > len(run.StepProgress)+1 {
-			run.CurrentStep = 1
-		}
-		if run.CurrentStep <= len(run.StepProgress) {
-			step := &run.StepProgress[run.CurrentStep-1]
-			if step.CompletedAt == nil && step.StartedAt != nil && !run.UpdatedAt.IsZero() {
-				stamp := run.UpdatedAt.UTC()
-				step.StartedAt = &stamp
-			}
+		if err := run.NormalizeStepProgress(); err != nil {
+			return fmt.Errorf("run %s: %w", id, err)
 		}
 		value.Runs[id] = run
 	}
+	return nil
 }
 
 func validateIndexes(value domain.Snapshot) error {
@@ -177,6 +184,11 @@ func (s *Store) Update(expected *int64, mutate func(*domain.Snapshot) error) err
 	}
 	candidate := s.snapshot.Clone()
 	if err := mutate(&candidate); err != nil {
+		if errors.Is(err, ErrNoChange) {
+			// The request duplicated an already-recorded fact. Report success
+			// from the current snapshot without consuming a revision or writing.
+			return nil
+		}
 		return err
 	}
 	candidate.Revision = s.snapshot.Revision + 1

@@ -4,6 +4,7 @@ import (
 	"sort"
 
 	"github.com/1260124186-cc/solo-0016-cellar-run-control/internal/domain"
+	"github.com/1260124186-cc/solo-0016-cellar-run-control/internal/storage"
 )
 
 type AdvanceStepInput struct {
@@ -157,16 +158,28 @@ func (s *Service) AdvanceRunStep(
 		if !ok {
 			return domain.NewError(domain.CodeRunNotFound, "run was not found")
 		}
-		if err := s.checkExpected(run.Version, input.ExpectedVersion); err != nil {
-			return err
-		}
-		changed, err := run.AdvanceRecipeStep(input.Sequence, s.clock.Now())
+		now := s.clock.Now()
+		outcome, err := run.InspectStepAdvance(input.Sequence, now)
 		if err != nil {
 			return err
 		}
-		if changed {
-			snapshot.Runs[id] = run.Clone()
+		if outcome == domain.StepAdvanceReplay {
+			// Duplicate confirmation of an already recorded step forms one
+			// fact. Return the recorded run and bypass a stale
+			// X-Expected-Version (the second terminal simply saw an older
+			// aggregate) without changing version or any time.
+			updated = run.Clone()
+			return storage.ErrNoChange
 		}
+		// A stale expected version still rejects a genuine new confirmation,
+		// before any state is changed.
+		if err := s.checkExpected(run.Version, input.ExpectedVersion); err != nil {
+			return err
+		}
+		if err := run.AdvanceRecipeStep(input.Sequence, now); err != nil {
+			return err
+		}
+		snapshot.Runs[id] = run.Clone()
 		updated = run.Clone()
 		return nil
 	})
