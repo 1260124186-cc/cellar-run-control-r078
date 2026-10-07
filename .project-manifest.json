@@ -1,0 +1,118 @@
+{
+  "schema_version": 1,
+  "name": "cellar-run-control",
+  "project_shape": "backend",
+  "modules": [
+    {
+      "id": "cmd",
+      "path": "cmd/fermentctl",
+      "responsibility": "start the service and run bounded workflow checks"
+    },
+    {
+      "id": "config",
+      "path": "internal/config",
+      "responsibility": "resolve environment and command-line configuration"
+    },
+    {
+      "id": "clock",
+      "path": "internal/clock",
+      "responsibility": "provide a replaceable time boundary"
+    },
+    {
+      "id": "domain",
+      "path": "internal/domain",
+      "responsibility": "entities, validation, state transitions, and metrics"
+    },
+    {
+      "id": "service",
+      "path": "internal/service",
+      "responsibility": "orchestrate formulas, vessels, runs, and observations"
+    },
+    {
+      "id": "storage",
+      "path": "internal/storage",
+      "responsibility": "persist and load revisioned JSON snapshots atomically"
+    },
+    {
+      "id": "httpapi",
+      "path": "internal/httpapi",
+      "responsibility": "route HTTP requests and map protocol errors"
+    },
+    {
+      "id": "workflowcheck",
+      "path": "internal/workflowcheck",
+      "responsibility": "exercise public HTTP workflows with real requests"
+    }
+  ],
+  "complexity": {
+    "mechanisms": [
+      "state_transition",
+      "resource_lifecycle",
+      "error_propagation",
+      "concurrency",
+      "validation_boundary"
+    ]
+  },
+  "workflows": [
+    {
+      "id": "formula-approval",
+      "name": "Create, configure, approve, and read a formula",
+      "entry": "POST /v1/formulas",
+      "steps": [
+        "create a draft formula with validated target values",
+        "set the process step list in one operation",
+        "approve the complete formula",
+        "read the immutable approved aggregate"
+      ],
+      "success": "returns the approved formula with version 3",
+      "failure": "returns a stable validation, duplicate, or state error without partial writes",
+      "verification": "the check issues real HTTP requests and inspects success and failure responses",
+      "module_ids": [
+        "httpapi",
+        "service",
+        "domain",
+        "storage"
+      ]
+    },
+    {
+      "id": "vessel-run-lifecycle",
+      "name": "Register a vessel and advance a reserved run to fermentation",
+      "entry": "POST /v1/vessels",
+      "steps": [
+        "register an available vessel",
+        "create a planned run against an approved formula",
+        "reserve the vessel atomically",
+        "start fermentation and read the combined state"
+      ],
+      "success": "returns an in-use vessel and a fermenting run",
+      "failure": "returns a stable capacity, availability, duplicate, or revision conflict",
+      "verification": "the check issues real HTTP requests, verifies rejection behavior, and reads the aggregate",
+      "module_ids": [
+        "httpapi",
+        "service",
+        "domain",
+        "storage"
+      ]
+    },
+    {
+      "id": "observations-completion",
+      "name": "Append observations, start conditioning, and complete a run",
+      "entry": "POST /v1/runs/{id}/observations",
+      "steps": [
+        "append ordered gravity and temperature observations",
+        "move the run to conditioning",
+        "complete the run and compute attenuation and estimated alcohol",
+        "read the completed run and released vessel state"
+      ],
+      "success": "returns computed metrics and a vessel in cleaning state",
+      "failure": "returns a stable range, sequence, time, state, or count error",
+      "verification": "the check issues real HTTP requests and rejects malformed observations",
+      "module_ids": [
+        "httpapi",
+        "service",
+        "domain",
+        "storage"
+      ]
+    }
+  ]
+}

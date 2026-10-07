@@ -1,0 +1,24 @@
+{
+  "schema_version": 1,
+  "language": "go",
+  "project_shape": "backend",
+  "source_extensions": [
+    ".go"
+  ],
+  "build_command": "go build ./...",
+  "testing": "deferred",
+  "workflow_checks": [
+    {
+      "workflow_id": "formula-approval",
+      "command": "go run ./cmd/fermentctl check formula-approval"
+    },
+    {
+      "workflow_id": "vessel-run-lifecycle",
+      "command": "go run ./cmd/fermentctl check vessel-run-lifecycle"
+    },
+    {
+      "workflow_id": "observations-completion",
+      "command": "go run ./cmd/fermentctl check observations-completion"
+    }
+  ]
+}
